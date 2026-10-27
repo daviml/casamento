@@ -564,7 +564,8 @@ async function sync(){
     for(let attempt=0;attempt<5&&!done;attempt++){
       const{data:remote,sha}=await ghRead(syncCfg);
       let merged;
-      if(remote&&remote.items&&!syncCfg.linked){
+      if(remote&&remote.items&&!syncCfg.linked&&syncCfg.preferCloud)merged=JSON.parse(JSON.stringify(remote));
+      else if(remote&&remote.items&&!syncCfg.linked){
         const quando=remote.savedAt?new Date(remote.savedAt).toLocaleString('pt-BR'):'';
         const useCloud=confirm('Encontrei dados salvos no GitHub'+(quando?' (última alteração em '+quando+')':'')+'.\n\nOK = usar os dados do GitHub neste aparelho (recomendado)\nCancelar = juntar os dados deste aparelho com os do GitHub');
         merged=useCloud?JSON.parse(JSON.stringify(remote)):mergeData(S,remote);
@@ -617,6 +618,33 @@ function parseSyncInput(repoTxt,tokenTxt){
   if(!tokenTxt)throw new Error('Cole o token do GitHub (começa com github_pat_) ou o código de conexão.');
   return{owner:m[0],repo:m[1],branch:'',path:'dados.json',token:tokenTxt};
 }
+
+/* ---------- Entrar com senha ----------
+   O código de conexão (com o token) fica em acesso.json, cifrado com AES-GCM e chave derivada da senha (PBKDF2).
+   Quem tem a senha entra sem colar token; sem a senha o arquivo é inútil. */
+let ACCESS=null;
+const u8b64=u=>btoa(String.fromCharCode(...u));
+const b64u8=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+async function deriveKey(pass,salt,it){
+  const base=await crypto.subtle.importKey('raw',new TextEncoder().encode(pass),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:it,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+async function lockCode(pass){
+  const it=600000,salt=crypto.getRandomValues(new Uint8Array(16)),iv=crypto.getRandomValues(new Uint8Array(12));
+  const c=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},await deriveKey(pass,salt,it),new TextEncoder().encode(syncCode())));
+  return{v:1,it,s:u8b64(salt),i:u8b64(iv),c:u8b64(c)};
+}
+async function unlockCode(A,pass){
+  const k=await deriveKey(pass,b64u8(A.s),A.it||600000);
+  try{return new TextDecoder().decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:b64u8(A.i)},k,b64u8(A.c)))}
+  catch(e){throw new Error('Senha errada.')}
+}
+async function loginWithPass(pass){
+  const cfg=parseSyncInput('',await unlockCode(ACCESS,pass));
+  cfg.preferCloud=true; // quem entra com senha usa os dados que já estão no GitHub, sem perguntar
+  await connectSync(cfg);
+}
+fetch('acesso.json',{cache:'no-store'}).then(r=>r.ok?r.json():null).then(j=>{if(j&&j.c){ACCESS=j;if(!syncCfg)render()}}).catch(()=>{});
 
 /* desfazer */
 let undoSnap=null,toastTimer=null;
@@ -717,9 +745,32 @@ function render(){
   const d=S.settings.date;
   $('#bSub').textContent=d?(daysUntil(d)>=0?'faltam '+daysUntil(d)+' dias · '+dmy(d):'casados em '+dmy(d)):'data ainda não definida';
   if(location.hash.slice(1)!==UI.tab)history.replaceState(null,'','#'+UI.tab);
-  const v={resumo:vResumo,itens:vItens,comida:vComida,dinheiro:vDinheiro,ajustes:vAjustes}[UI.tab]||vResumo;
+  const login=!syncCfg&&ACCESS&&!UI.skipLogin;
+  const v=login?vLogin:{resumo:vResumo,itens:vItens,comida:vComida,dinheiro:vDinheiro,ajustes:vAjustes}[UI.tab]||vResumo;
   $('#view').innerHTML=v();
+  document.querySelector('.fab').style.display=login?'none':'';
+  if(login)setTimeout(()=>$('#lgPass')?.focus(),30);
   setSaveState();
+}
+
+function vLogin(){
+  return `
+  <div class="card" style="max-width:420px;margin:32px auto;text-align:center;padding:28px 22px">
+    <div style="font-size:46px;line-height:1">💍</div>
+    <h2 class="title" style="margin-top:10px">${esc(S.settings.names||'Nosso Casamento')}</h2>
+    <p class="sub">Digite a senha do casamento para ver e editar o orçamento junto.</p>
+    <input class="in" type="password" id="lgPass" placeholder="Senha" autocomplete="current-password" style="text-align:center;font-size:17px;height:48px">
+    <div id="lgMsg"></div>
+    <button class="btn primary" data-action="login" style="width:100%;margin-top:12px;height:46px">Entrar</button>
+    <button class="link" data-action="skipLogin" style="margin-top:16px">Usar sem conectar (só neste aparelho)</button>
+  </div>`;
+}
+async function doLogin(btn){
+  const pass=$('#lgPass').value,msg=$('#lgMsg');
+  if(!pass){$('#lgPass').focus();return}
+  btn.disabled=true;btn.textContent='Entrando…';msg.innerHTML='';
+  try{await loginWithPass(pass);UI.tab='resumo';render();toast('☁ Conectado — vocês dois estão vendo os mesmos dados')}
+  catch(x){btn.disabled=false;btn.textContent='Entrar';msg.innerHTML='<div class="banner warn" style="margin:12px 0 0;justify-content:center">'+esc(x.message)+'</div>';$('#lgPass').select()}
 }
 
 function vResumo(){
@@ -964,8 +1015,18 @@ function vAjustes(){
           <button class="btn sm" data-action="syncCode">📋 Copiar código para o outro celular</button>
           <button class="btn sm danger" data-action="syncOff">Desconectar este aparelho</button>
         </div>
-        <div class="hint">Cada alteração vai para o GitHub alguns segundos depois e fica no histórico (dá para voltar qualquer versão). Se os dois editarem ao mesmo tempo, o app junta as mudanças.</div>`
-      :`
+        <div class="hint">Cada alteração vai para o GitHub alguns segundos depois e fica no histórico (dá para voltar qualquer versão). Se os dois editarem ao mesmo tempo, o app junta as mudanças.</div>
+        <hr style="border:0;border-top:1px solid var(--border);margin:16px 0">
+        <h3>🔑 Senha do casamento ${ACCESS?'<span class="pill s-pago">ativa</span>':'<span class="pill">não criada</span>'}</h3>
+        <div class="t2">Com a senha, a Letícia (ou você em outro aparelho) só abre o site e digita a senha — sem token nem código.${ACCESS?' Para trocar a senha, crie uma nova aqui.':''}</div>
+        <div class="two">
+          <div><label class="f">Nova senha</label><input class="in" type="password" id="acPass" autocomplete="new-password" placeholder="mínimo 10 caracteres"></div>
+          <div><label class="f">Repetir a senha</label><input class="in" type="password" id="acPass2" autocomplete="new-password"></div>
+        </div>
+        <div id="acMsg"></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px"><button class="btn sm primary" data-action="makeAccess">Criar acesso por senha</button></div>
+        <div class="hint">Use uma frase fácil de lembrar e difícil de adivinhar, como <i>praça do primeiro beijo 2027</i>. Nada de data de aniversário ou 123456: o arquivo cifrado fica público no site.</div>`
+      :`${ACCESS?`<div class="banner info" style="margin:0 0 12px">🔑 Tem a senha do casamento? <button class="btn sm primary" data-action="showLogin">Entrar com a senha</button></div>`:''}
         <div class="two" style="margin-top:4px">
           <div><label class="f">Repositório</label><input class="in" id="syRepo" value="daviml/casamento-dados" placeholder="usuario/repositorio"></div>
           <div><label class="f">Token do GitHub ou código de conexão</label><input class="in" id="syToken" type="password" placeholder="github_pat_… ou código copiado do outro celular" autocomplete="off"></div>
@@ -1234,6 +1295,26 @@ document.addEventListener('click',e=>{
     case 'syncNow':sync();break;
     case 'install':if(installEvt){installEvt.prompt();installEvt.userChoice.finally(()=>{installEvt=null;$('#installBtn').style.display='none'})}break;
     case 'syncOff':if(confirm('Desconectar este aparelho do GitHub? Os dados continuam salvos aqui e no GitHub.')){disconnectSync();render()}break;
+    case 'login':doLogin(el);break;
+    case 'skipLogin':UI.skipLogin=true;render();break;
+    case 'showLogin':UI.skipLogin=false;render();scrollTo(0,0);break;
+    case 'makeAccess':{
+      const p=$('#acPass').value,p2=$('#acPass2').value,msg=$('#acMsg');
+      const err=t=>{msg.innerHTML='<div class="banner warn" style="margin:10px 0 0">'+t+'</div>'};
+      if(p.length<10)return err('Use pelo menos 10 caracteres.');
+      if(p!==p2)return err('As duas senhas não são iguais.');
+      el.disabled=true;el.textContent='Criando…';
+      lockCode(p).then(A=>{
+        const json=JSON.stringify(A);
+        const url='https://github.com/daviml/casamento/'+(ACCESS?'edit/main/acesso.json':'new/main?filename=acesso.json&value='+encodeURIComponent(json));
+        msg.innerHTML=`<div class="banner info" style="margin:10px 0 0;display:block">
+          <b>Falta publicar.</b> ${ACCESS?'Abra o arquivo no GitHub, apague o conteúdo, cole o texto copiado e toque em <b>Commit changes</b>.':'Toque em <b>Publicar no GitHub</b> e depois em <b>Commit changes</b>.'} Em 1 a 2 minutos a senha passa a valer.
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><a class="btn sm primary" style="display:inline-flex;align-items:center;text-decoration:none" href="${url}" target="_blank" rel="noopener">Publicar no GitHub</a><button class="btn sm" id="acCopy">📋 Copiar texto</button></div></div>`;
+        $('#acCopy').onclick=()=>copyText(json,'Texto do acesso copiado');
+        if(ACCESS)copyText(json,'Texto do acesso copiado — cole no GitHub');
+        el.disabled=false;el.textContent='Criar acesso por senha';
+      }).catch(x=>{el.disabled=false;el.textContent='Criar acesso por senha';err(esc(x.message))});
+      break}
     case 'syncCode':copyText(syncCode(),'Código copiado — cole no campo do token no outro celular');break;
     case 'syncOn':{
       const msg=$('#syMsg'),btn=el;
@@ -1272,6 +1353,7 @@ document.addEventListener('change',e=>{
   }
   if(t.id==='pWho'||t.id==='sWho'){try{localStorage.setItem('cas-who',t.value)}catch(x){}}
 });
+document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='lgPass'){e.preventDefault();doLogin($('[data-action="login"]'))}});
 document.addEventListener('input',e=>{if(e.target.id==='search'){UI.search=e.target.value;const pos=e.target.selectionStart;render();const s=$('#search');s.focus();s.setSelectionRange(pos,pos)}});
 addEventListener('storage',e=>{if(e.key===KEY&&e.newValue){S=normalize(JSON.parse(e.newValue));snapRecs();render()}});
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')sync()});
